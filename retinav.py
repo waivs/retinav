@@ -27,6 +27,7 @@ speed (Shift = 10x); a quick tap moves it 1 pixel.
 In the preview pane: click or drag to move the crosshair.
 """
 import math
+import random
 import sys
 import time
 import tkinter as tk
@@ -87,7 +88,8 @@ class App(tk.Tk):
         self.gap = tk.IntVar(value=6)           # gap around center (px)
         self.thick = tk.IntVar(value=2)
         self.full = tk.BooleanVar(value=False)  # full-screen lines
-        self.dot = tk.BooleanVar(value=True)
+        self.dot_style = tk.StringVar(value="Sparkle")   # None / Dot / Sparkle / Spin
+        self._anim_id = None
         self.color = "#00ff00"
         self.visible = tk.BooleanVar(value=True)
         self.ppd = tk.StringVar(value="40")     # pixels per degree (string so partial typing is OK)
@@ -124,6 +126,7 @@ class App(tk.Tk):
         self._bind_keys()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.draw()
+        self._update_anim()
 
         # Put the controller on the primary monitor
         primary = next((m for m in self.monitors if m.is_primary), self.monitors[0])
@@ -182,14 +185,19 @@ class App(tk.Tk):
 
         ttk.Checkbutton(f, text="Full-screen lines", variable=self.full,
                         command=self.draw).grid(row=8, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(f, text="Center dot", variable=self.dot,
-                        command=self.draw).grid(row=8, column=2, columnspan=2, sticky="w", **pad)
+        cf = ttk.Frame(f)
+        cf.grid(row=8, column=2, columnspan=2, sticky="w", **pad)
+        ttk.Label(cf, text="Center").pack(side="left")
+        cb = ttk.Combobox(cf, textvariable=self.dot_style, state="readonly", width=8,
+                          values=["None", "Dot", "Sparkle", "Spin"])
+        cb.pack(side="left", padx=4)
+        cb.bind("<<ComboboxSelected>>", lambda e: self._on_visible())
 
         self.color_btn = tk.Button(f, text="Color…", bg=self.color, width=10,
                                    command=self.pick_color)
         self.color_btn.grid(row=9, column=0, columnspan=2, **pad)
         ttk.Checkbutton(f, text="Show crosshair", variable=self.visible,
-                        command=self.draw).grid(row=9, column=2, columnspan=2, sticky="w", **pad)
+                        command=self._on_visible).grid(row=9, column=2, columnspan=2, sticky="w", **pad)
 
         ttk.Label(f, text="Pixels / degree").grid(row=10, column=0, sticky="w", **pad)
         spin = ttk.Spinbox(f, from_=0.1, to=10000, increment=1, width=8,
@@ -396,10 +404,7 @@ class App(tk.Tk):
             pv.create_line(px + g, py, px + L, py, **kw)
             pv.create_line(px, py - L, px, py - g, **kw)
             pv.create_line(px, py + g, px, py + L, **kw)
-        if self.dot.get():
-            r = max(1.5, w)
-            pv.create_oval(px - r, py - r, px + r, py + r,
-                           fill=self.color, outline="#000000", tags="xh")
+        self._draw_center(pv, px, py, s, t, "#000000", ("xh",))
         if target is not None:               # ring showing where the crosshair is heading
             tx, ty = target[0] * s, target[1] * s
             pv.create_oval(tx - 5, ty - 5, tx + 5, ty + 5, outline="#ffffff", width=1,
@@ -517,6 +522,71 @@ class App(tk.Tk):
         return int(round(float(var.get())))
 
     # ---------- drawing ----------
+    # ---------- center marker + animation ----------
+    @staticmethod
+    def _star(cv, x, y, R, rot, fill, outline, kw):
+        """Four-pointed star (a 'sparkle' glyph)."""
+        pts = []
+        for i in range(8):
+            a = rot + i * math.pi / 4
+            rad = R if i % 2 == 0 else R * 0.28
+            pts += [x + rad * math.cos(a), y + rad * math.sin(a)]
+        cv.create_polygon(pts, fill=fill, outline=outline, **kw)
+
+    def _draw_center(self, cv, x, y, k, t, outline=None, tags=()):
+        """Draw the center marker. k = canvas scale (1.0 for the overlay), t = thickness in px."""
+        style = self.dot_style.get()
+        if style == "None":
+            return
+        col, ol = self.color, (outline or self.color)
+        kw = {"tags": tags} if tags else {}
+        now = time.monotonic()
+        S = lambda v: max(1.5, v * k)          # scaled size with a visible minimum
+
+        if style == "Dot":
+            r = S(max(1, t))
+            cv.create_oval(x - r, y - r, x + r, y + r, fill=col, outline=ol, **kw)
+
+        elif style == "Spin":
+            R, r = S(max(8, 4 * t)), S(max(2, t * 0.9))
+            ang = now * 2 * math.pi * 1.2      # 1.2 revolutions / second
+            for i in range(3):
+                a = ang + i * 2 * math.pi / 3
+                ox, oy = x + R * math.cos(a), y + R * math.sin(a)
+                cv.create_oval(ox - r, oy - r, ox + r, oy + r, fill=col, outline=ol, **kw)
+            r0 = S(max(1, t * 0.6))
+            cv.create_oval(x - r0, y - r0, x + r0, y + r0, fill=col, outline=ol, **kw)
+
+        else:  # Sparkle
+            base = max(6, t * 3)
+            pulse = 0.75 + 0.35 * math.sin(now * 2 * math.pi * 2.2)
+            self._star(cv, x, y, S(base * pulse), now * 0.8, col, ol, kw)
+            for i in range(5):                 # small twinkles that pop in and fade out
+                phase = now * 2.5 + i * 0.37
+                bucket, frac = int(phase), phase - int(phase)
+                rnd = random.Random(bucket * 131 + i * 977)
+                a = rnd.uniform(0, 2 * math.pi)
+                d = rnd.uniform(1.2, 2.6) * base * k
+                size = base * 0.55 * math.sin(math.pi * frac) * k
+                if size >= 0.8:
+                    self._star(cv, x + d * math.cos(a), y + d * math.sin(a), size,
+                               rnd.uniform(0, math.pi), "#ffffff", "#ffffff", kw)
+
+    def _on_visible(self):
+        self.draw()
+        self._update_anim()
+
+    def _update_anim(self):
+        """Run a ~30 fps redraw loop only while an animated center style is showing."""
+        animated = self.visible.get() and self.dot_style.get() in ("Sparkle", "Spin")
+        if animated and self._anim_id is None:
+            self._anim_id = self.after(33, self._anim_tick)
+
+    def _anim_tick(self):
+        self._anim_id = None
+        self.draw()
+        self._update_anim()
+
     def draw(self):
         c = self.overlay.canvas
         c.delete("all")
@@ -551,9 +621,7 @@ class App(tk.Tk):
         c.create_line(x + g, y, x + L, y, **kw)
         c.create_line(x, y - L, x, y - g, **kw)
         c.create_line(x, y + g, x, y + L, **kw)
-        if self.dot.get():
-            r = max(1, t)
-            c.create_oval(x - r, y - r, x + r, y + r, fill=self.color, outline=self.color)
+        self._draw_center(c, x, y, 1.0, t)
 
 
 if __name__ == "__main__":
