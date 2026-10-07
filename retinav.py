@@ -20,11 +20,15 @@ pane showing the crosshair position over a picture you load.
 Install:  pip install screeninfo pillow
 Run:      python crosshair.py
 
-Shortcuts (control window focused): arrow keys move by the step size (Shift = 10x).
+Movement: the X/Y sliders, the recenter button and clicks/drags in the preview set a TARGET
+position; the crosshair glides there at the rate in the Speed field. Holding the arrow keys
+(control window focused) or the on-screen arrow buttons moves the crosshair directly at that
+speed (Shift = 10x); a quick tap moves it 1 pixel.
 In the preview pane: click or drag to move the crosshair.
 """
 import math
 import sys
+import time
 import tkinter as tk
 from tkinter import ttk, colorchooser, filedialog, messagebox
 
@@ -79,7 +83,6 @@ class App(tk.Tk):
 
         self.x = tk.IntVar(value=self.mon.width // 2)
         self.y = tk.IntVar(value=self.mon.height // 2)
-        self.step = tk.IntVar(value=5)
         self.size = tk.IntVar(value=40)         # arm length (px)
         self.gap = tk.IntVar(value=6)           # gap around center (px)
         self.thick = tk.IntVar(value=2)
@@ -88,6 +91,20 @@ class App(tk.Tk):
         self.color = "#00ff00"
         self.visible = tk.BooleanVar(value=True)
         self.ppd = tk.StringVar(value="40")     # pixels per degree (string so partial typing is OK)
+
+        # Continuous-movement state
+        self.speed = tk.StringVar(value="200")
+        self.speed_unit = tk.StringVar(value="px/s")
+        self._held = set()          # direction names currently held
+        self._rel = {}              # pending (debounced) key releases
+        self._shift = False
+        self._loop_id = None
+        self._last_t = 0.0
+        # self.x / self.y are the TARGET; px / py are where the crosshair actually is right now
+        self.px = self.mon.width / 2
+        self.py = self.mon.height / 2
+        self.x.trace_add("write", lambda *_: self._ensure_loop())
+        self.y.trace_add("write", lambda *_: self._ensure_loop())
 
         # Preview state
         self.image = None                       # PIL image loaded by the user
@@ -147,13 +164,18 @@ class App(tk.Tk):
 
         pad_f = ttk.Frame(f)
         pad_f.grid(row=3, column=0, columnspan=4, pady=8)
-        ttk.Button(pad_f, text="▲", width=4, command=lambda: self.nudge(0, -1)).grid(row=0, column=1)
-        ttk.Button(pad_f, text="◀", width=4, command=lambda: self.nudge(-1, 0)).grid(row=1, column=0)
+        self._dir_button(pad_f, "▲", "Up", 0, 1)
+        self._dir_button(pad_f, "◀", "Left", 1, 0)
         ttk.Button(pad_f, text="●", width=4, command=self.center).grid(row=1, column=1)
-        ttk.Button(pad_f, text="▶", width=4, command=lambda: self.nudge(1, 0)).grid(row=1, column=2)
-        ttk.Button(pad_f, text="▼", width=4, command=lambda: self.nudge(0, 1)).grid(row=2, column=1)
+        self._dir_button(pad_f, "▶", "Right", 1, 2)
+        self._dir_button(pad_f, "▼", "Down", 2, 1)
 
-        self._slider(f, 4, "Step", self.step, 1, 100, redraw=False)
+        ttk.Label(f, text="Speed").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Spinbox(f, from_=0.1, to=100000, increment=10, width=8,
+                    textvariable=self.speed).grid(row=4, column=1, sticky="w", **pad)
+        ttk.Combobox(f, textvariable=self.speed_unit, values=["px/s", "°/s"],
+                     state="readonly", width=5).grid(row=4, column=2, sticky="w", **pad)
+        ttk.Label(f, text="Shift = 10×", foreground="#666").grid(row=4, column=3, sticky="w")
         self._slider(f, 5, "Arm length", self.size, 5, 1000)
         self._slider(f, 6, "Center gap", self.gap, 0, 100)
         self._slider(f, 7, "Thickness", self.thick, 1, 20)
@@ -228,10 +250,42 @@ class App(tk.Tk):
         return scale
 
     def _bind_keys(self):
-        for key, (dx, dy) in {"<Left>": (-1, 0), "<Right>": (1, 0),
-                              "<Up>": (0, -1), "<Down>": (0, 1)}.items():
-            self.bind(key, lambda e, dx=dx, dy=dy: self.nudge(dx, dy))
-            self.bind(f"<Shift-{key[1:-1]}>", lambda e, dx=dx, dy=dy: self.nudge(dx * 10, dy * 10))
+        self.bind("<KeyPress>", self._on_key_press)
+        self.bind("<KeyRelease>", self._on_key_release)
+        self.bind("<FocusOut>", self._on_focus_out)
+
+    def _dir_button(self, parent, text, name, row, col):
+        b = ttk.Button(parent, text=text, width=4)
+        b.grid(row=row, column=col)
+        b.bind("<ButtonPress-1>", lambda e: self.press_dir(name))
+        b.bind("<ButtonRelease-1>", lambda e: self.release_dir(name))
+
+    def _on_key_press(self, e):
+        if e.keysym in ("Shift_L", "Shift_R"):
+            self._shift = True
+        elif e.keysym in self.DIRS:
+            if e.state & 0x1:
+                self._shift = True
+            pending = self._rel.pop(e.keysym, None)
+            if pending:                      # X11 auto-repeat: release+press pair, ignore it
+                self.after_cancel(pending)
+            self.press_dir(e.keysym)
+
+    def _on_key_release(self, e):
+        if e.keysym in ("Shift_L", "Shift_R"):
+            self._shift = False
+        elif e.keysym in self.DIRS:
+            # debounce so auto-repeat on some platforms doesn't stutter the motion
+            self._rel[e.keysym] = self.after(30, lambda k=e.keysym: self._finish_release(k))
+
+    def _finish_release(self, key):
+        self._rel.pop(key, None)
+        self.release_dir(key)
+
+    def _on_focus_out(self, e):
+        if e.widget is self:                 # window lost focus: stop any movement
+            self._held.clear()
+            self._shift = False
 
     # ---------- preview ----------
     def resize_preview(self):
@@ -325,7 +379,7 @@ class App(tk.Tk):
         self.y.set(y)
         self.draw()
 
-    def _draw_preview_crosshair(self, x, y, L, g, t):
+    def _draw_preview_crosshair(self, x, y, L, g, t, target=None):
         pv, s = self.pv, self.pv_scale
         pv.delete("xh")
         if not self.visible.get():
@@ -346,10 +400,15 @@ class App(tk.Tk):
             r = max(1.5, w)
             pv.create_oval(px - r, py - r, px + r, py + r,
                            fill=self.color, outline="#000000", tags="xh")
+        if target is not None:               # ring showing where the crosshair is heading
+            tx, ty = target[0] * s, target[1] * s
+            pv.create_oval(tx - 5, ty - 5, tx + 5, ty + 5, outline="#ffffff", width=1,
+                           dash=(2, 2), tags="xh")
 
     # ---------- actions ----------
     def _on_monitor(self, _=None):
         self.mon = self.monitors[self.mon_box.current()]
+        self.px, self.py = self.mon.width / 2, self.mon.height / 2   # snap, don't glide
         self.overlay.place_on(self.mon)
         self.x_scale.config(to=self.mon.width - 1)
         self.y_scale.config(to=self.mon.height - 1)
@@ -361,10 +420,81 @@ class App(tk.Tk):
         self.y.set(self.mon.height // 2)
         self.draw()
 
-    def nudge(self, dx, dy):
-        s = self.step.get()
-        self.x.set(max(0, min(self.mon.width - 1, self._i(self.x) + dx * s)))
-        self.y.set(max(0, min(self.mon.height - 1, self._i(self.y) + dy * s)))
+    # ---------- continuous movement ----------
+    DIRS = {"Left": (-1, 0), "Right": (1, 0), "Up": (0, -1), "Down": (0, 1)}
+
+    def _speed_px(self):
+        """Current speed in pixels/second, or None if the field is invalid."""
+        try:
+            v = float(self.speed.get())
+        except (ValueError, tk.TclError):
+            return None
+        if v <= 0:
+            return None
+        if self.speed_unit.get() == "°/s":
+            ppd = self._ppd()
+            if ppd is None:
+                return None
+            v *= ppd
+        return v
+
+    def press_dir(self, name):
+        if name in self._held:
+            return
+        self._held.add(name)
+        dx, dy = self.DIRS[name]
+        self._move_by(dx, dy)                # 1-pixel nudge so a tap is precise
+        self._ensure_loop()
+
+    def release_dir(self, name):
+        self._held.discard(name)
+
+    def _ensure_loop(self):
+        if self._loop_id is None:
+            self._last_t = time.monotonic()
+            self._loop_id = self.after(16, self._tick)
+
+    def _tick(self):
+        """Animation step (~60 Hz): hold-to-move, or glide toward the target at the set speed."""
+        now = time.monotonic()
+        dt = min(now - self._last_t, 0.1)
+        self._last_t = now
+        speed = self._speed_px()
+        busy = False
+
+        if self._held:                       # direct movement from arrow keys / buttons
+            busy = True
+            if speed is not None:
+                if self._shift:
+                    speed *= 10
+                vx = sum(self.DIRS[d][0] for d in self._held)
+                vy = sum(self.DIRS[d][1] for d in self._held)
+                n = math.hypot(vx, vy)
+                if n:                        # normalize so diagonals aren't faster
+                    self._move_by(vx / n * speed * dt, vy / n * speed * dt)
+        else:                                # glide toward target
+            tx, ty = self._i(self.x), self._i(self.y)
+            dx, dy = tx - self.px, ty - self.py
+            dist = math.hypot(dx, dy)
+            if dist > 1e-6:
+                step = None if speed is None else speed * dt
+                if step is None or step >= dist:      # arrived (or no valid speed: jump)
+                    self.px, self.py = float(tx), float(ty)
+                else:
+                    self.px += dx / dist * step
+                    self.py += dy / dist * step
+                    busy = True
+                self.draw()
+
+        # Keep _loop_id non-None while running so variable traces don't start a second loop
+        self._loop_id = self.after(16, self._tick) if busy else None
+
+    def _move_by(self, dx, dy):
+        """Move the crosshair directly (target follows, so no gliding afterwards)."""
+        self.px = max(0.0, min(self.mon.width - 1, self.px + dx))
+        self.py = max(0.0, min(self.mon.height - 1, self.py + dy))
+        self.x.set(round(self.px))
+        self.y.set(round(self.py))
         self.draw()
 
     def pick_color(self):
@@ -390,23 +520,30 @@ class App(tk.Tk):
     def draw(self):
         c = self.overlay.canvas
         c.delete("all")
-        x, y = self._i(self.x), self._i(self.y)
+        x, y = self.px, self.py                       # where the crosshair is right now
+        tx, ty = self._i(self.x), self._i(self.y)     # where it is heading
         L, g, t = self._i(self.size), self._i(self.gap), self._i(self.thick)
         W, H = self.mon.width, self.mon.height
+        moving = math.hypot(tx - x, ty - y) > 0.5
+
         ppd = self._ppd()
+        extra = ""
         if ppd is None:
             self.deg_label.config(text="Degrees: enter a positive pixels/degree value")
-            fov = ""
         else:
-            dx = (x - W / 2) / ppd
-            dy = (H / 2 - y) / ppd
-            self.deg_label.config(text=f"X {dx:+.2f}°    Y {dy:+.2f}°")
-            fov = f"\nMonitor spans {W / ppd:.1f}° × {H / ppd:.1f}°"
-        self.status.config(text=f"Pixels: ({x}, {y})   Absolute: ({self.mon.x + x}, {self.mon.y + y})" + fov)
-        self._draw_preview_crosshair(x, y, L, g, t)
+            self.deg_label.config(
+                text=f"X {(x - W / 2) / ppd:+.2f}°    Y {(H / 2 - y) / ppd:+.2f}°")
+            extra = f"\nMonitor spans {W / ppd:.1f}° × {H / ppd:.1f}°"
+            if moving:
+                extra += (f"\nTarget: X {(tx - W / 2) / ppd:+.2f}°  Y {(H / 2 - ty) / ppd:+.2f}°"
+                          f"  ({math.hypot(tx - x, ty - y) / ppd:.2f}° to go)")
+        xi, yi = round(x), round(y)
+        self.status.config(text=f"Pixels: ({xi}, {yi})   "
+                                f"Absolute: ({self.mon.x + xi}, {self.mon.y + yi})" + extra)
+
+        self._draw_preview_crosshair(x, y, L, g, t, (tx, ty) if moving else None)
         if not self.visible.get():
             return
-        W, H = self.mon.width, self.mon.height
         if self.full.get():
             L = max(W, H)
         kw = dict(fill=self.color, width=t)
