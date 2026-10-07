@@ -23,6 +23,7 @@ Run:      python crosshair.py
 Shortcuts (control window focused): arrow keys move by the step size (Shift = 10x).
 In the preview pane: click or drag to move the crosshair.
 """
+import math
 import sys
 import tkinter as tk
 from tkinter import ttk, colorchooser, filedialog, messagebox
@@ -94,6 +95,9 @@ class App(tk.Tk):
         self.pv_scale = 1.0
         self.pv_w = self.pv_h = 0
         self._pv_photo = None
+        self._base = None                       # image after Stretch/Fit/Fill, before zoom/rotate
+        self.img_scale = tk.IntVar(value=100)   # percent
+        self.img_rot = tk.IntVar(value=0)       # degrees, counter-clockwise
  
         self.overlay = Overlay(self)
         self.overlay.place_on(self.mon)
@@ -172,28 +176,42 @@ class App(tk.Tk):
  
         self.pv = tk.Canvas(f, bg=PREVIEW_BG, highlightthickness=1,
                             highlightbackground="#888", cursor="crosshair")
-        self.pv.grid(row=1, column=0, columnspan=3, pady=4)
+        self.pv.grid(row=1, column=0, columnspan=4, pady=4)
         self.pv.bind("<Button-1>", self._on_preview_mouse)
         self.pv.bind("<B1-Motion>", self._on_preview_mouse)
  
-        ttk.Button(f, text="Load picture…", command=self.load_image).grid(row=2, column=0, sticky="w")
-        ttk.Button(f, text="Clear", command=self.clear_image).grid(row=2, column=1, sticky="w", padx=4)
-        mode = ttk.Combobox(f, textvariable=self.fit_mode, state="readonly", width=9,
+        bar = ttk.Frame(f)
+        bar.grid(row=2, column=0, columnspan=4, sticky="ew")
+        ttk.Button(bar, text="Load picture…", command=self.load_image).pack(side="left")
+        ttk.Button(bar, text="Clear", command=self.clear_image).pack(side="left", padx=4)
+        mode = ttk.Combobox(bar, textvariable=self.fit_mode, state="readonly", width=9,
                             values=["Stretch", "Fit", "Fill"])
-        mode.grid(row=2, column=2, sticky="e")
-        mode.bind("<<ComboboxSelected>>", lambda e: self.render_preview_bg())
+        mode.pack(side="right")
+        mode.bind("<<ComboboxSelected>>", lambda e: self.rebuild_base())
+ 
+        # Image scale / rotation
+        self._slider(f, 3, "Scale %", self.img_scale, 10, 400, command=self._on_transform)
+        self._slider(f, 4, "Rotate °", self.img_rot, -180, 180, command=self._on_transform)
+        tools = ttk.Frame(f)
+        tools.grid(row=5, column=0, columnspan=4, sticky="w", padx=8, pady=2)
+        ttk.Button(tools, text="⟲ 90°", width=7, command=lambda: self.rotate_by(90)).pack(side="left")
+        ttk.Button(tools, text="⟳ 90°", width=7, command=lambda: self.rotate_by(-90)).pack(side="left", padx=4)
+        ttk.Button(tools, text="Reset scale/rotation", command=self.reset_transform).pack(side="left")
  
         self.img_label = ttk.Label(f, text="No picture loaded", foreground="#666")
-        self.img_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        ttk.Label(f, text="Stretch: fill exactly · Fit: keep aspect, letterbox · Fill: keep aspect, crop",
-                  foreground="#666", wraplength=PREVIEW_MAX[0]).grid(row=4, column=0, columnspan=3, sticky="w")
+        self.img_label.grid(row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Label(f, text="Stretch: fill exactly · Fit: keep aspect, letterbox · Fill: keep aspect, crop. "
+                          "Scale and rotation apply on top of the mode, around the center.",
+                  foreground="#666", wraplength=PREVIEW_MAX[0]).grid(row=7, column=0, columnspan=4, sticky="w")
  
         self.resize_preview()
  
-    def _slider(self, parent, row, label, var, lo, hi, redraw=True):
+    def _slider(self, parent, row, label, var, lo, hi, redraw=True, command=None):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=2)
         scale = ttk.Scale(parent, from_=lo, to=hi, variable=var, orient="horizontal",
-                          length=220, command=(lambda _=None: self.draw()) if redraw else None)
+                          length=220,
+                          command=(lambda _=None: command()) if command
+                          else (lambda _=None: self.draw()) if redraw else None)
         scale.grid(row=row, column=1, columnspan=2, sticky="ew", padx=8, pady=2)
         ttk.Label(parent, textvariable=var, width=5).grid(row=row, column=3)
         return scale
@@ -212,26 +230,56 @@ class App(tk.Tk):
         self.pv_w = max(1, round(W * self.pv_scale))
         self.pv_h = max(1, round(H * self.pv_scale))
         self.pv.config(width=self.pv_w, height=self.pv_h)
-        self.render_preview_bg()
+        self.rebuild_base()
  
-    def render_preview_bg(self):
-        """Redraw the background picture (only when image/mode/monitor changes)."""
-        self.pv.delete("bg")
-        self._pv_photo = None
+    def rebuild_base(self):
+        """Fit the loaded picture to the monitor rectangle (Stretch / Fit / Fill)."""
+        self._base = None
         if self.image is not None:
             size = (self.pv_w, self.pv_h)
             mode = self.fit_mode.get()
             if mode == "Stretch":
-                img = self.image.resize(size, Image.LANCZOS)
+                self._base = self.image.resize(size, Image.LANCZOS)
             elif mode == "Fill":
-                img = ImageOps.fit(self.image, size, Image.LANCZOS)
+                self._base = ImageOps.fit(self.image, size, Image.LANCZOS)
             else:  # Fit / letterbox
                 fitted = ImageOps.contain(self.image, size, Image.LANCZOS)
-                img = Image.new("RGB", size, PREVIEW_BG)
-                img.paste(fitted, ((size[0] - fitted.width) // 2, (size[1] - fitted.height) // 2))
-            self._pv_photo = ImageTk.PhotoImage(img)
-            self.pv.create_image(0, 0, image=self._pv_photo, anchor="nw", tags="bg")
-            self.pv.tag_lower("bg")
+                self._base = Image.new("RGB", size, (0, 0, 0))
+                self._base.paste(fitted, ((size[0] - fitted.width) // 2,
+                                          (size[1] - fitted.height) // 2))
+        self.render_preview_bg()
+ 
+    def render_preview_bg(self):
+        """Apply zoom + rotation about the center and show the result."""
+        self.pv.delete("bg")
+        self._pv_photo = None
+        if self._base is None:
+            return
+        sc = max(0.01, self.img_scale.get() / 100.0)
+        th = math.radians(self.img_rot.get())
+        c, s_ = math.cos(th), math.sin(th)
+        cx, cy = self.pv_w / 2, self.pv_h / 2
+        # Inverse affine: output pixel -> source pixel
+        coeffs = (c / sc, -s_ / sc, cx - (cx * c - cy * s_) / sc,
+                  s_ / sc, c / sc, cy - (cx * s_ + cy * c) / sc)
+        img = self._base.transform((self.pv_w, self.pv_h), Image.AFFINE, coeffs,
+                                   Image.BILINEAR, fillcolor=(0, 0, 0))
+        self._pv_photo = ImageTk.PhotoImage(img)
+        self.pv.create_image(0, 0, image=self._pv_photo, anchor="nw", tags="bg")
+        self.pv.tag_lower("bg")
+ 
+    def _on_transform(self):
+        self.render_preview_bg()
+ 
+    def rotate_by(self, deg):
+        r = (self.img_rot.get() + deg + 180) % 360 - 180   # keep within -180..179
+        self.img_rot.set(r)
+        self.render_preview_bg()
+ 
+    def reset_transform(self):
+        self.img_scale.set(100)
+        self.img_rot.set(0)
+        self.render_preview_bg()
  
     def load_image(self):
         path = filedialog.askopenfilename(
@@ -250,12 +298,14 @@ class App(tk.Tk):
         self.image_path = path
         name = path.replace("\\", "/").rsplit("/", 1)[-1]
         self.img_label.config(text=f"{name} ({self.image.width}×{self.image.height})")
-        self.render_preview_bg()
+        self.img_scale.set(100)
+        self.img_rot.set(0)
+        self.rebuild_base()
  
     def clear_image(self):
         self.image = None
         self.img_label.config(text="No picture loaded")
-        self.render_preview_bg()
+        self.rebuild_base()
  
     def _on_preview_mouse(self, event):
         x = int(max(0, min(self.mon.width - 1, event.x / self.pv_scale)))
