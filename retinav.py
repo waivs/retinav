@@ -13,8 +13,8 @@ The plan is to use Claude or similar AI code building tools and refine it manual
 
 
 """
-Crosshair overlay: draws a crosshair on a chosen monitor (default: a secondary one)
-and lets you move it from a control window. The control window also has a preview
+Crosshair display: shows a crosshair on a black full-screen window on a chosen monitor
+(default: a secondary one) and lets you move it from a control window. The control window also has a preview
 pane showing the crosshair position over a picture you load.
  
 Install:  pip install screeninfo pillow
@@ -38,56 +38,32 @@ if sys.platform == "win32":
     except Exception:
         ctypes.windll.user32.SetProcessDPIAware()
  
-KEY = "#ff00ff"            # background color treated as transparent (Windows/Linux)
 PREVIEW_MAX = (480, 320)   # max preview pane size in pixels
-PREVIEW_BG = "#202020"
+OVERLAY_BG = "#000000"     # background of the full-screen window on the second monitor
+PREVIEW_BG = OVERLAY_BG
  
  
 class Overlay(tk.Toplevel):
-    """Borderless, always-on-top, transparent window covering one monitor."""
+    """Borderless, always-on-top, black window covering one monitor."""
  
     def __init__(self, master):
         super().__init__(master)
-        self.canvas = tk.Canvas(self, bg=KEY, highlightthickness=0, bd=0)
+        self.config(bg=OVERLAY_BG)
+        self.canvas = tk.Canvas(self, bg=OVERLAY_BG, highlightthickness=0, bd=0,
+                                cursor="none")
         self.canvas.pack(fill="both", expand=True)
  
         if sys.platform == "darwin":
             # overrideredirect is unreliable on macOS Tk; use MacWindowStyle instead
             self.tk.call("::tk::unsupported::MacWindowStyle", "style",
                          self._w, "plain", "none")
-            self.attributes("-transparent", True)
-            self.config(bg="systemTransparent")
-            self.canvas.config(bg="systemTransparent")
         else:
             self.overrideredirect(True)
-            self._setup_transparency()
         self.attributes("-topmost", True)
- 
-    def _setup_transparency(self):
-        if sys.platform == "win32":
-            self.attributes("-transparentcolor", KEY)
-        else:
-            try:  # needs a compositing window manager
-                self.attributes("-transparentcolor", KEY)
-            except tk.TclError:
-                self.attributes("-alpha", 0.6)
- 
-    def make_click_through(self):
-        if sys.platform != "win32":
-            return
-        import ctypes
-        self.update_idletasks()
-        user32 = ctypes.windll.user32
-        hwnd = user32.GetParent(self.winfo_id()) or self.winfo_id()
-        GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_TOOLWINDOW = -20, 0x80000, 0x20, 0x80
-        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                              style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)
  
     def place_on(self, mon):
         self.geometry(f"{mon.width}x{mon.height}{mon.x:+d}{mon.y:+d}")
         self.update_idletasks()
-        self.make_click_through()
         self.lift()
  
  
@@ -332,7 +308,7 @@ class App(tk.Tk):
  
     def pick_color(self):
         c = colorchooser.askcolor(color=self.color, parent=self)[1]
-        if c and c.lower() != KEY:
+        if c:
             self.color = c
             self.color_btn.config(bg=c)
             self.draw()
@@ -367,4 +343,3 @@ class App(tk.Tk):
  
 if __name__ == "__main__":
     App().mainloop()
- 
