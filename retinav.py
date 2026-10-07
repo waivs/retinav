@@ -11,7 +11,6 @@ The plan is to use Claude or similar AI code building tools and refine it manual
 
 """
 
-
 """
 Crosshair display: shows a crosshair on a black full-screen window on a chosen monitor
 (default: a secondary one) and lets you move it from a control window. The control window also has a preview
@@ -19,6 +18,11 @@ pane showing the crosshair position over a picture you load.
 
 Install:  pip install screeninfo pillow
 Run:      python crosshair.py
+
+Trajectories: type coordinates (one "x, y [, wait_seconds]" per line) or generate a pattern
+(circle, square, figure-8, spiral, raster, random), then press Start. The crosshair follows the
+path at the rate in the Speed field. Coordinates are degrees from the monitor center (+X right,
++Y up) or pixels from the monitor's top-left corner.
 
 Movement: the X/Y sliders, the recenter button and clicks/drags in the preview set a TARGET
 position; the crosshair glides there at the rate in the Speed field. Holding the arrow keys
@@ -28,6 +32,7 @@ In the preview pane: click or drag to move the crosshair.
 """
 import math
 import random
+import re
 import sys
 import time
 import tkinter as tk
@@ -47,6 +52,102 @@ if sys.platform == "win32":
 PREVIEW_MAX = (480, 320)   # max preview pane size in pixels
 OVERLAY_BG = "#000000"     # background of the full-screen window on the second monitor
 PREVIEW_BG = OVERLAY_BG
+
+PATTERNS = ["Custom list", "Circle", "Square", "Figure-8", "Spiral", "Raster", "Random"]
+PATTERN_POINTS = {"Circle": 36, "Square": 4, "Figure-8": 72, "Spiral": 120, "Raster": 6, "Random": 8}
+
+
+# ---- trajectory helpers (pure functions, no GUI) ----
+_NUM = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+
+
+def parse_waypoints(text):
+    """'x, y[, wait]' per line -> [(x, y, wait_seconds)]. '#' starts a comment."""
+    pts = []
+    for n, line in enumerate(text.splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        nums = _NUM.findall(line)
+        if len(nums) < 2:
+            raise ValueError(f"Line {n}: need at least an x and a y value")
+        wait = float(nums[2]) if len(nums) > 2 else 0.0
+        pts.append((float(nums[0]), float(nums[1]), max(0.0, wait)))
+    return pts
+
+
+def to_pixels(pts, unit, W, H, ppd):
+    """Convert waypoints to monitor pixels (top-left origin), clamped to the screen.
+    Returns (points, number_clamped)."""
+    out, clamped = [], 0
+    for x, y, w in pts:
+        if unit == "deg":
+            x, y = W / 2 + x * ppd, H / 2 - y * ppd
+        cx, cy = min(max(x, 0.0), W - 1.0), min(max(y, 0.0), H - 1.0)
+        clamped += (cx != x) or (cy != y)
+        out.append((cx, cy, w))
+    return out, clamped
+
+
+def gen_pattern(name, R, n, rng=random):
+    """Pattern offsets (u, v) from the center, v pointing up, in the same unit as R."""
+    if name == "Circle":
+        return [(R * math.cos(2 * math.pi * i / n), R * math.sin(2 * math.pi * i / n))
+                for i in range(n + 1)]
+    if name == "Square":
+        return [(-R, R), (R, R), (R, -R), (-R, -R), (-R, R)]
+    if name == "Figure-8":
+        return [(R * math.sin(2 * math.pi * i / n), 0.5 * R * math.sin(4 * math.pi * i / n))
+                for i in range(n + 1)]
+    if name == "Spiral":
+        out = []
+        for i in range(n):
+            f = i / max(1, n - 1)
+            th = 3 * 2 * math.pi * f            # three turns
+            out.append((R * f * math.cos(th), R * f * math.sin(th)))
+        return out
+    if name == "Raster":
+        rows, out = max(2, n), []
+        for r in range(rows):
+            v = R - 2 * R * r / (rows - 1)
+            xs = (-R, R) if r % 2 == 0 else (R, -R)
+            out += [(xs[0], v), (xs[1], v)]
+        return out
+    if name == "Random":
+        return [(rng.uniform(-R, R), rng.uniform(-R, R)) for _ in range(n)]
+    return []
+
+
+def advance_path(state, px, py, speed, dt):
+    """Move (px, py) along state['pts'] for dt seconds at `speed` px/s, carrying leftover
+    distance through corners. state: pts, i (next point), wait, loop, done. Returns new (px, py)."""
+    pts, tleft, guard = state["pts"], dt, 0
+    while tleft > 1e-12 and not state["done"] and guard < 2000:
+        guard += 1
+        if state["wait"] > 0:                       # dwelling at a point
+            d = min(state["wait"], tleft)
+            state["wait"] -= d
+            tleft -= d
+            continue
+        tx, ty, w = pts[state["i"]]
+        dist = math.hypot(tx - px, ty - py)
+        if dist <= speed * tleft:                   # reach this point and keep going
+            tleft -= dist / speed
+            px, py = tx, ty
+            state["wait"] = w
+            state["i"] += 1
+            if state["i"] >= len(pts):
+                if state["loop"]:
+                    state["i"] = 0
+                else:
+                    state["done"] = True
+        else:
+            f = speed * tleft / dist
+            px += (tx - px) * f
+            py += (ty - py) * f
+            tleft = 0
+    return px, py
+# ---- end trajectory helpers ----
 
 
 class Overlay(tk.Toplevel):
@@ -90,6 +191,16 @@ class App(tk.Tk):
         self.full = tk.BooleanVar(value=False)  # full-screen lines
         self.dot_style = tk.StringVar(value="Sparkle")   # None / Dot / Sparkle / Spin
         self._anim_id = None
+
+        # Trajectory state
+        self.pat_name = tk.StringVar(value="Circle")
+        self.pat_size = tk.StringVar(value="10")
+        self.pat_n = tk.StringVar(value=str(PATTERN_POINTS["Circle"]))
+        self.traj_unit = tk.StringVar(value="deg")
+        self._unit_prev = "deg"
+        self.traj_loop = tk.BooleanVar(value=False)
+        self._traj = None            # running trajectory state, or None
+        self._path_after = None
         self.color = "#00ff00"
         self.visible = tk.BooleanVar(value=True)
         self.ppd = tk.StringVar(value="40")     # pixels per degree (string so partial typing is OK)
@@ -203,7 +314,7 @@ class App(tk.Tk):
         spin = ttk.Spinbox(f, from_=0.1, to=10000, increment=1, width=8,
                            textvariable=self.ppd, command=self.draw)
         spin.grid(row=10, column=1, sticky="w", **pad)
-        self.ppd.trace_add("write", lambda *_: self.draw())
+        self.ppd.trace_add("write", lambda *_: (self.draw(), self._sched_path_refresh()))
         ttk.Label(f, text="origin = monitor center\n+X right, +Y up",
                   foreground="#666").grid(row=10, column=2, columnspan=2, sticky="w", **pad)
 
@@ -245,6 +356,57 @@ class App(tk.Tk):
                           "Scale and rotation apply on top of the mode, around the center.",
                   foreground="#666", wraplength=PREVIEW_MAX[0]).grid(row=7, column=0, columnspan=4, sticky="w")
 
+        # Trajectory panel
+        tf = ttk.LabelFrame(f, text="Trajectory", padding=6)
+        tf.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+
+        r1 = ttk.Frame(tf)
+        r1.grid(row=0, column=0, sticky="w")
+        ttk.Label(r1, text="Pattern").pack(side="left")
+        pat = ttk.Combobox(r1, textvariable=self.pat_name, state="readonly", width=10, values=PATTERNS)
+        pat.pack(side="left", padx=4)
+        pat.bind("<<ComboboxSelected>>", self._on_pattern_change)
+        ttk.Label(r1, text="Size").pack(side="left")
+        ttk.Spinbox(r1, from_=0.1, to=10000, increment=1, width=6,
+                    textvariable=self.pat_size).pack(side="left", padx=4)
+        ttk.Label(r1, text="Points").pack(side="left")
+        ttk.Spinbox(r1, from_=2, to=2000, increment=1, width=5,
+                    textvariable=self.pat_n).pack(side="left", padx=4)
+        ttk.Button(r1, text="Generate", command=self.generate_pattern).pack(side="left", padx=4)
+
+        r2 = ttk.Frame(tf)
+        r2.grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(r2, text="Coordinates in").pack(side="left")
+        ucb = ttk.Combobox(r2, textvariable=self.traj_unit, state="readonly", width=5,
+                           values=["deg", "px"])
+        ucb.pack(side="left", padx=4)
+        ucb.bind("<<ComboboxSelected>>", self._on_traj_unit)
+        ttk.Checkbutton(r2, text="Loop", variable=self.traj_loop,
+                        command=self._refresh_path).pack(side="left", padx=10)
+
+        tw = ttk.Frame(tf)
+        tw.grid(row=2, column=0, sticky="ew")
+        self.traj_text = tk.Text(tw, width=52, height=6, wrap="none", font="TkFixedFont", undo=True)
+        sb = ttk.Scrollbar(tw, orient="vertical", command=self.traj_text.yview)
+        self.traj_text.config(yscrollcommand=sb.set)
+        self.traj_text.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        self.traj_text.bind("<KeyRelease>", lambda e: self._sched_path_refresh())
+        self.traj_text.bind("<<Paste>>", lambda e: self._sched_path_refresh())
+        self.traj_text.bind("<<Cut>>", lambda e: self._sched_path_refresh())
+
+        r3 = ttk.Frame(tf)
+        r3.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        self.traj_btn = ttk.Button(r3, text="▶ Start", width=10, command=self.toggle_trajectory)
+        self.traj_btn.pack(side="left")
+        self.traj_status = ttk.Label(r3, text="", foreground="#666", wraplength=340)
+        self.traj_status.pack(side="left", padx=8)
+        ttk.Label(tf, foreground="#666", wraplength=PREVIEW_MAX[0],
+                  text="One point per line: x, y [, wait seconds]. Lines starting with # are "
+                       "comments. The crosshair follows the path at the Speed setting."
+                  ).grid(row=4, column=0, sticky="w", pady=(4, 0))
+
+        self.generate_pattern()
         self.resize_preview()
 
     def _slider(self, parent, row, label, var, lo, hi, redraw=True, command=None):
@@ -269,6 +431,9 @@ class App(tk.Tk):
         b.bind("<ButtonRelease-1>", lambda e: self.release_dir(name))
 
     def _on_key_press(self, e):
+        cls = e.widget.winfo_class() if hasattr(e.widget, "winfo_class") else ""
+        if cls in ("Text", "Entry", "TEntry", "TSpinbox", "TCombobox"):
+            return                                   # let the widget handle its own keys
         if e.keysym in ("Shift_L", "Shift_R"):
             self._shift = True
         elif e.keysym in self.DIRS:
@@ -304,6 +469,7 @@ class App(tk.Tk):
         self.pv_h = max(1, round(H * self.pv_scale))
         self.pv.config(width=self.pv_w, height=self.pv_h)
         self.rebuild_base()
+        self._refresh_path()
 
     def rebuild_base(self):
         """Fit the loaded picture to the monitor rectangle (Stretch / Fit / Fill)."""
@@ -381,6 +547,8 @@ class App(tk.Tk):
         self.rebuild_base()
 
     def _on_preview_mouse(self, event):
+        if self._traj is not None:
+            self.stop_trajectory("Stopped (manual move).")
         x = int(max(0, min(self.mon.width - 1, event.x / self.pv_scale)))
         y = int(max(0, min(self.mon.height - 1, event.y / self.pv_scale)))
         self.x.set(x)
@@ -412,6 +580,8 @@ class App(tk.Tk):
 
     # ---------- actions ----------
     def _on_monitor(self, _=None):
+        if self._traj is not None:
+            self.stop_trajectory("Stopped (monitor changed).")
         self.mon = self.monitors[self.mon_box.current()]
         self.px, self.py = self.mon.width / 2, self.mon.height / 2   # snap, don't glide
         self.overlay.place_on(self.mon)
@@ -446,6 +616,8 @@ class App(tk.Tk):
     def press_dir(self, name):
         if name in self._held:
             return
+        if self._traj is not None:
+            self.stop_trajectory("Stopped (manual move).")
         self._held.add(name)
         dx, dy = self.DIRS[name]
         self._move_by(dx, dy)                # 1-pixel nudge so a tap is precise
@@ -477,6 +649,24 @@ class App(tk.Tk):
                 n = math.hypot(vx, vy)
                 if n:                        # normalize so diagonals aren't faster
                     self._move_by(vx / n * speed * dt, vy / n * speed * dt)
+        elif self._traj is not None:         # following a trajectory
+            busy = True
+            T = self._traj
+            if speed is None:
+                self.stop_trajectory("Stopped: enter a valid speed.")
+            else:
+                T["loop"] = self.traj_loop.get()
+                self.px, self.py = advance_path(T, self.px, self.py, speed, dt)
+                self.x.set(round(self.px))
+                self.y.set(round(self.py))
+                self.draw()
+                if T["done"]:
+                    self.stop_trajectory("Finished.")
+                else:
+                    msg = f"Running – heading to point {T['i'] + 1} of {len(T['pts'])}"
+                    if T["wait"] > 0:
+                        msg += f" (waiting {T['wait']:.1f}s)"
+                    self.traj_status.config(text=msg, foreground="#666")
         else:                                # glide toward target
             tx, ty = self._i(self.x), self._i(self.y)
             dx, dy = tx - self.px, ty - self.py
@@ -522,6 +712,147 @@ class App(tk.Tk):
         return int(round(float(var.get())))
 
     # ---------- drawing ----------
+    # ---------- trajectory ----------
+    def _set_traj_text(self, text):
+        self.traj_text.delete("1.0", "end")
+        self.traj_text.insert("1.0", text + "\n")
+        self._refresh_path(True)
+
+    def _on_pattern_change(self, _=None):
+        n = PATTERN_POINTS.get(self.pat_name.get())
+        if n:
+            self.pat_n.set(str(n))
+        self.generate_pattern()
+
+    def generate_pattern(self):
+        name = self.pat_name.get()
+        if name == "Custom list":
+            self.traj_status.config(text="Type your own coordinates, or pick a pattern.", foreground="#666")
+            return
+        try:
+            R, n = float(self.pat_size.get()), int(float(self.pat_n.get()))
+        except ValueError:
+            self.traj_status.config(text="Size and Points must be numbers.", foreground="#b00020")
+            return
+        if R <= 0 or n < 1:
+            self.traj_status.config(text="Size must be > 0 and Points ≥ 1.", foreground="#b00020")
+            return
+        W, H = self.mon.width, self.mon.height
+        lines = []
+        for u, v in gen_pattern(name, R, max(2, n) if name != "Random" else n):
+            x, y = (u, v) if self.traj_unit.get() == "deg" else (W / 2 + u, H / 2 - v)
+            lines.append(f"{x:.3f}, {y:.3f}")
+        self._set_traj_text(f"# {name}\n" + "\n".join(lines))
+
+    def _on_traj_unit(self, _=None):
+        """Switching units converts the existing coordinates so the path stays the same."""
+        new, old = self.traj_unit.get(), self._unit_prev
+        if new == old:
+            return
+        ppd = self._ppd()
+        if ppd is None:
+            self.traj_unit.set(old)
+            self.traj_status.config(text="Set a valid pixels/degree before converting units.",
+                                    foreground="#b00020")
+            return
+        W, H = self.mon.width, self.mon.height
+        try:
+            lines = []
+            for x, y, w in parse_waypoints(self.traj_text.get("1.0", "end")):
+                if old == "deg":
+                    x, y = W / 2 + x * ppd, H / 2 - y * ppd
+                else:
+                    x, y = (x - W / 2) / ppd, (H / 2 - y) / ppd
+                lines.append(f"{x:.3f}, {y:.3f}" + (f", {w:g}" if w else ""))
+            self._set_traj_text("\n".join(lines))
+        except ValueError:
+            pass                                        # invalid text: leave it as typed
+        try:
+            sz = float(self.pat_size.get())
+            self.pat_size.set(f"{sz * ppd:g}" if old == "deg" else f"{sz / ppd:g}")
+        except ValueError:
+            pass
+        self._unit_prev = new
+        self._refresh_path()
+
+    def _sched_path_refresh(self):
+        if self._path_after is not None:
+            self.after_cancel(self._path_after)
+        self._path_after = self.after(250, lambda: self._refresh_path(True))
+
+    def _refresh_path(self, update_status=False):
+        """Parse the coordinate box and draw the path over the preview picture."""
+        if self._path_after is not None:
+            self.after_cancel(self._path_after)
+            self._path_after = None
+        self.pv.delete("path")
+        try:
+            pts = parse_waypoints(self.traj_text.get("1.0", "end"))
+        except ValueError as e:
+            if update_status:
+                self.traj_status.config(text=str(e), foreground="#b00020")
+            return
+        ppd = self._ppd()
+        if not pts or (self.traj_unit.get() == "deg" and ppd is None):
+            return
+        pix, clamped = to_pixels(pts, self.traj_unit.get(), self.mon.width, self.mon.height, ppd)
+        k, col = self.pv_scale, "#00e5ff"
+        if len(pix) >= 2:
+            self.pv.create_line(*[c * k for p in pix for c in p[:2]],
+                                fill=col, dash=(4, 3), tags="path")
+            if self.traj_loop.get() and len(pix) > 2:
+                self.pv.create_line(pix[-1][0] * k, pix[-1][1] * k, pix[0][0] * k, pix[0][1] * k,
+                                    fill=col, dash=(1, 4), tags="path")
+        if len(pix) <= 300:
+            for i, (x, y, _w) in enumerate(pix):
+                r = 4 if i == 0 else 2.5
+                self.pv.create_oval(x * k - r, y * k - r, x * k + r, y * k + r,
+                                    fill=col, outline="", tags="path")
+        if len(pix) <= 24:
+            for i, (x, y, _w) in enumerate(pix):
+                self.pv.create_text(x * k + 8, y * k - 8, text=str(i + 1), fill=col,
+                                    font=("TkDefaultFont", 8), tags="path")
+        self.pv.tag_raise("xh")
+        if update_status and self._traj is None:
+            note = f" ({clamped} outside the screen – clamped)" if clamped else ""
+            self.traj_status.config(text=f"{len(pts)} point(s){note}", foreground="#666")
+
+    def toggle_trajectory(self):
+        if self._traj is not None:
+            self.stop_trajectory("Stopped.")
+        else:
+            self.start_trajectory()
+
+    def start_trajectory(self):
+        speed = self._speed_px()
+        if speed is None:
+            self.traj_status.config(text="Enter a valid positive Speed first.", foreground="#b00020")
+            return
+        try:
+            pts = parse_waypoints(self.traj_text.get("1.0", "end"))
+        except ValueError as e:
+            self.traj_status.config(text=str(e), foreground="#b00020")
+            return
+        if not pts:
+            self.traj_status.config(text="No coordinates to follow.", foreground="#b00020")
+            return
+        ppd = self._ppd()
+        if self.traj_unit.get() == "deg" and ppd is None:
+            self.traj_status.config(text="Enter a valid pixels/degree value.", foreground="#b00020")
+            return
+        pix, _ = to_pixels(pts, self.traj_unit.get(), self.mon.width, self.mon.height, ppd)
+        self._traj = {"pts": pix, "i": 0, "wait": 0.0, "loop": self.traj_loop.get(), "done": False}
+        self._held.clear()
+        self.traj_btn.config(text="■ Stop")
+        self.traj_status.config(text="Running…", foreground="#666")
+        self._ensure_loop()
+
+    def stop_trajectory(self, msg=""):
+        self._traj = None
+        self.traj_btn.config(text="▶ Start")
+        if msg:
+            self.traj_status.config(text=msg, foreground="#666")
+
     # ---------- center marker + animation ----------
     @staticmethod
     def _star(cv, x, y, R, rot, fill, outline, kw):
