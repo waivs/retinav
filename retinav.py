@@ -24,7 +24,7 @@ Run:      python crosshair.py
 
 Trajectories: type coordinates (one "x, y [, wait_seconds]" per line) or generate a pattern
 (circle, square, figure-8, spiral, raster, random), then press Start. The crosshair follows the
-path at the rate in the Speed field. Coordinates are degrees from the monitor center (+X right,
+path at the rate in the Speed field. Coordinates are degrees from the origin (the monitor center + ORIGIN_OFFSET_PIXELS; +X right,
 +Y up) or pixels from the monitor's top-left corner.
 
 Movement: the X/Y sliders, the recenter button and clicks/drags in the preview set a TARGET
@@ -59,6 +59,8 @@ OVERLAY_BG = "#000000"     # background of the full-screen window on the second 
 # ---- Calibration: edit these for your particular monitor / picture ----
 PIXELS_PER_DEGREE = 40.0                 # monitor pixels per degree of visual angle
 PREVIEW_IMAGE_PIXELS_PER_DEGREE = 40.0   # pixels of the loaded picture per degree (its angular scale)
+ORIGIN_OFFSET_PIXELS = (0, 0)            # (dx, dy) in px of the (0°, 0°) origin from the monitor center;
+                                         # +dx moves it right, +dy moves it down (screen coordinates)
 POSITION_FONT_SIZE = 32                  # point size of the large X/Y position readout (degrees)
 DEFAULT_TRAJECTORY_UNIT = "deg"          # "deg" or "px"
 DEFAULT_PATTERN = "Spiral"               # initial trajectory pattern
@@ -90,13 +92,14 @@ def parse_waypoints(text):
     return pts
 
 
-def to_pixels(pts, unit, W, H, ppd):
+def to_pixels(pts, unit, W, H, ppd, origin=None):
     """Convert waypoints to monitor pixels (top-left origin), clamped to the screen.
     Returns (points, number_clamped)."""
+    ox, oy = origin if origin else (W / 2, H / 2)
     out, clamped = [], 0
     for x, y, w in pts:
         if unit == "deg":
-            x, y = W / 2 + x * ppd, H / 2 - y * ppd
+            x, y = ox + x * ppd, oy - y * ppd
         cx, cy = min(max(x, 0.0), W - 1.0), min(max(y, 0.0), H - 1.0)
         clamped += (cx != x) or (cy != y)
         out.append((cx, cy, w))
@@ -198,8 +201,9 @@ class App(tk.Tk):
         self.monitors = get_monitors()
         self.mon = self._default_monitor()
 
-        self.x = tk.IntVar(value=self.mon.width // 2)
-        self.y = tk.IntVar(value=self.mon.height // 2)
+        hx, hy = self._home()
+        self.x = tk.IntVar(value=round(hx))
+        self.y = tk.IntVar(value=round(hy))
         self.size = tk.IntVar(value=40)         # arm length (px)
         self.gap = tk.IntVar(value=6)           # gap around center (px)
         self.thick = tk.IntVar(value=2)
@@ -230,8 +234,7 @@ class App(tk.Tk):
         self._loop_id = None
         self._last_t = 0.0
         # self.x / self.y are the TARGET; px / py are where the crosshair actually is right now
-        self.px = self.mon.width / 2
-        self.py = self.mon.height / 2
+        self.px, self.py = float(hx), float(hy)
         self.x.trace_add("write", lambda *_: self._ensure_loop())
         self.y.trace_add("write", lambda *_: self._ensure_loop())
 
@@ -327,8 +330,10 @@ class App(tk.Tk):
                         command=self._on_visible).grid(row=9, column=2, columnspan=2, sticky="w", **pad)
 
         ttk.Label(f, foreground="#666",
-                  text=f"Scale: {PIXELS_PER_DEGREE:g} px/°  ·  origin = monitor center, "
-                       f"+X right, +Y up").grid(row=10, column=0, columnspan=4, sticky="w", **pad)
+                  text=f"Scale: {PIXELS_PER_DEGREE:g} px/°  ·  origin = monitor center"
+                       + (f" {ORIGIN_OFFSET_PIXELS[0]:+g}, {ORIGIN_OFFSET_PIXELS[1]:+g} px"
+                          if any(ORIGIN_OFFSET_PIXELS) else "")
+                       + ", +X right, +Y up").grid(row=10, column=0, columnspan=4, sticky="w", **pad)
 
         # Large fixed-width readout so the layout doesn't jitter as digits change
         big = (tkfont.nametofont("TkFixedFont").actual("family"), POSITION_FONT_SIZE, "bold")
@@ -366,9 +371,9 @@ class App(tk.Tk):
 
         self.img_label = ttk.Label(f, text="No picture loaded", foreground="#666")
         self.img_label.grid(row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        ttk.Label(f, text="Degrees: true angular scale (PREVIEW_IMAGE_PIXELS_PER_DEGREE), centered · "
+        ttk.Label(f, text="Degrees: true angular scale (PREVIEW_IMAGE_PIXELS_PER_DEGREE), centered on the origin · "
                           "Stretch: fill exactly · Fit: keep aspect, letterbox · Fill: keep aspect, "
-                          "crop. Scale and rotation apply on top, around the center.",
+                          "crop. Scale and rotation apply on top, around the center (the origin in Degrees mode).",
                   foreground="#666", wraplength=PREVIEW_MAX[0]).grid(row=7, column=0, columnspan=4, sticky="w")
 
         # Trajectory panel
@@ -494,7 +499,16 @@ class App(tk.Tk):
         self.pv_h = max(1, round(H * self.pv_scale))
         self.pv.config(width=self.pv_w, height=self.pv_h)
         self.rebuild_base()
+        self._draw_origin_marker()
         self._refresh_path()
+
+    def _draw_origin_marker(self):
+        """Small gray plus in the preview marking the (0°, 0°) origin."""
+        self.pv.delete("origin")
+        ox, oy = self._origin()
+        x, y = ox * self.pv_scale, oy * self.pv_scale
+        for coords in ((x - 7, y, x + 7, y), (x, y - 7, x, y + 7)):
+            self.pv.create_line(*coords, fill="#888888", tags="origin")
 
     def rebuild_base(self):
         """Fit the loaded picture to the monitor rectangle (Stretch / Fit / Fill)."""
@@ -504,14 +518,15 @@ class App(tk.Tk):
             mode = self.fit_mode.get()
             if mode == "Degrees":
                 # True angular scale: the picture's px/deg mapped onto the monitor's px/deg,
-                # centered on the monitor center (0°, 0°).
+                # centered on the coordinate origin (0°, 0°).
                 g = (PIXELS_PER_DEGREE / PREVIEW_IMAGE_PIXELS_PER_DEGREE) * self.pv_scale
                 img = self.image
                 if g < 1:                         # pre-shrink for clean downscaling
                     img = img.resize((max(1, round(img.width * g)), max(1, round(img.height * g))),
                                      Image.LANCZOS)
                     g = 1.0
-                cx, cy = self.pv_w / 2, self.pv_h / 2
+                ox, oy = self._origin()
+                cx, cy = ox * self.pv_scale, oy * self.pv_scale
                 coeffs = (1 / g, 0, img.width / 2 - cx / g, 0, 1 / g, img.height / 2 - cy / g)
                 self._base = img.transform(size, Image.AFFINE, coeffs, Image.BILINEAR,
                                            fillcolor=(0, 0, 0))
@@ -535,7 +550,11 @@ class App(tk.Tk):
         sc = max(0.01, self.img_scale.get() / 100.0)
         th = math.radians(self.img_rot.get())
         c, s_ = math.cos(th), math.sin(th)
-        cx, cy = self.pv_w / 2, self.pv_h / 2
+        if self.fit_mode.get() == "Degrees":      # pivot about the origin so the picture stays put
+            ox, oy = self._origin()
+            cx, cy = ox * self.pv_scale, oy * self.pv_scale
+        else:
+            cx, cy = self.pv_w / 2, self.pv_h / 2
         # Inverse affine: output pixel -> source pixel
         coeffs = (c / sc, -s_ / sc, cx - (cx * c - cy * s_) / sc,
                   s_ / sc, c / sc, cy - (cx * s_ + cy * c) / sc)
@@ -624,16 +643,27 @@ class App(tk.Tk):
         if self._traj is not None:
             self.stop_trajectory("Stopped (monitor changed).")
         self.mon = self.monitors[self.mon_box.current()]
-        self.px, self.py = self.mon.width / 2, self.mon.height / 2   # snap, don't glide
+        self.px, self.py = self._home()                              # snap, don't glide
         self.overlay.place_on(self.mon)
         self.x_scale.config(to=self.mon.width - 1)
         self.y_scale.config(to=self.mon.height - 1)
         self.resize_preview()
         self.center()
 
+    def _origin(self):
+        """Pixel position of the (0°, 0°) origin on the current monitor (may be off-screen)."""
+        return (self.mon.width / 2 + ORIGIN_OFFSET_PIXELS[0],
+                self.mon.height / 2 + ORIGIN_OFFSET_PIXELS[1])
+
+    def _home(self):
+        """The origin, clamped onto the screen (used as the start / recenter position)."""
+        ox, oy = self._origin()
+        return (min(max(ox, 0.0), self.mon.width - 1.0), min(max(oy, 0.0), self.mon.height - 1.0))
+
     def center(self):
-        self.x.set(self.mon.width // 2)
-        self.y.set(self.mon.height // 2)
+        hx, hy = self._home()
+        self.x.set(round(hx))
+        self.y.set(round(hy))
         self.draw()
 
     # ---------- continuous movement ----------
@@ -795,7 +825,8 @@ class App(tk.Tk):
         W, H = self.mon.width, self.mon.height
         lines = []
         for u, v in gen_pattern(name, R, max(2, n) if name != "Random" else n, turns):
-            x, y = (u, v) if self.traj_unit.get() == "deg" else (W / 2 + u, H / 2 - v)
+            ox, oy = self._origin()
+            x, y = (u, v) if self.traj_unit.get() == "deg" else (ox + u, oy - v)
             lines.append(f"{x + 0.0:.3f}, {y + 0.0:.3f}")
         self._set_traj_text(f"# {name}\n" + "\n".join(lines))
 
@@ -814,10 +845,11 @@ class App(tk.Tk):
         try:
             lines = []
             for x, y, w in parse_waypoints(self.traj_text.get("1.0", "end")):
+                ox, oy = self._origin()
                 if old == "deg":
-                    x, y = W / 2 + x * ppd, H / 2 - y * ppd
+                    x, y = ox + x * ppd, oy - y * ppd
                 else:
-                    x, y = (x - W / 2) / ppd, (H / 2 - y) / ppd
+                    x, y = (x - ox) / ppd, (oy - y) / ppd
                 lines.append(f"{x + 0.0:.3f}, {y + 0.0:.3f}" + (f", {w:g}" if w else ""))
             self._set_traj_text("\n".join(lines))
         except ValueError:
@@ -850,7 +882,8 @@ class App(tk.Tk):
         ppd = self._ppd()
         if not pts or (self.traj_unit.get() == "deg" and ppd is None):
             return
-        pix, clamped = to_pixels(pts, self.traj_unit.get(), self.mon.width, self.mon.height, ppd)
+        pix, clamped = to_pixels(pts, self.traj_unit.get(), self.mon.width, self.mon.height, ppd,
+                                 self._origin())
         k, col = self.pv_scale, "#00e5ff"
         if len(pix) >= 2:
             self.pv.create_line(*[c * k for p in pix for c in p[:2]],
@@ -895,7 +928,8 @@ class App(tk.Tk):
         if self.traj_unit.get() == "deg" and ppd is None:
             self.traj_status.config(text="Enter a valid pixels/degree value.", foreground="#b00020")
             return
-        pix, _ = to_pixels(pts, self.traj_unit.get(), self.mon.width, self.mon.height, ppd)
+        pix, _ = to_pixels(pts, self.traj_unit.get(), self.mon.width, self.mon.height, ppd,
+                           self._origin())
         self._traj = {"pts": pix, "i": 0, "wait": 0.0, "loop": self.traj_loop.get(), "done": False}
         self._held.clear()
         self.traj_btn.config(text="■ Stop")
@@ -987,12 +1021,13 @@ class App(tk.Tk):
         if ppd is None:
             self.deg_label.config(text="Degrees: enter a positive pixels/degree value")
         else:
+            ox, oy = self._origin()
             fmt = lambda v: f"{round(v, 2) + 0.0:+8.2f}"      # no "-0.00"
             self.deg_label.config(
-                text=f"X {fmt((x - W / 2) / ppd)}°\nY {fmt((H / 2 - y) / ppd)}°")
+                text=f"X {fmt((x - ox) / ppd)}°\nY {fmt((oy - y) / ppd)}°")
             extra = f"\nMonitor spans {W / ppd:.1f}° × {H / ppd:.1f}°"
             if moving:
-                extra += (f"\nTarget: X {(tx - W / 2) / ppd:+.2f}°  Y {(H / 2 - ty) / ppd:+.2f}°"
+                extra += (f"\nTarget: X {(tx - ox) / ppd:+.2f}°  Y {(oy - ty) / ppd:+.2f}°"
                           f"  ({math.hypot(tx - x, ty - y) / ppd:.2f}° to go)")
         xi, yi = round(x), round(y)
         self.status.config(text=f"Pixels: ({xi}, {yi})   "
