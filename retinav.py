@@ -16,6 +16,9 @@ Crosshair display: shows a crosshair on a black full-screen window on a chosen m
 (default: a secondary one) and lets you move it from a control window. The control window also has a preview
 pane showing the crosshair position over a picture you load.
 
+Calibration: set PIXELS_PER_DEGREE (monitor) and PREVIEW_IMAGE_PIXELS_PER_DEGREE (loaded
+picture) in the constants at the top of this file for each monitor / picture setup.
+
 Install:  pip install screeninfo pillow
 Run:      python crosshair.py
 
@@ -51,6 +54,12 @@ if sys.platform == "win32":
 
 PREVIEW_MAX = (480, 320)   # max preview pane size in pixels
 OVERLAY_BG = "#000000"     # background of the full-screen window on the second monitor
+
+# ---- Calibration: edit these for your particular monitor / picture ----
+PIXELS_PER_DEGREE = 40.0                 # monitor pixels per degree of visual angle
+PREVIEW_IMAGE_PIXELS_PER_DEGREE = 40.0   # pixels of the loaded picture per degree (its angular scale)
+if PIXELS_PER_DEGREE <= 0 or PREVIEW_IMAGE_PIXELS_PER_DEGREE <= 0:
+    raise ValueError("PIXELS_PER_DEGREE and PREVIEW_IMAGE_PIXELS_PER_DEGREE must be positive")
 PREVIEW_BG = OVERLAY_BG
 
 PATTERNS = ["Custom list", "Circle", "Square", "Figure-8", "Spiral", "Raster", "Random"]
@@ -203,7 +212,6 @@ class App(tk.Tk):
         self._path_after = None
         self.color = "#00ff00"
         self.visible = tk.BooleanVar(value=True)
-        self.ppd = tk.StringVar(value="40")     # pixels per degree (string so partial typing is OK)
 
         # Continuous-movement state
         self.speed = tk.StringVar(value="200")
@@ -222,7 +230,7 @@ class App(tk.Tk):
         # Preview state
         self.image = None                       # PIL image loaded by the user
         self.image_path = ""
-        self.fit_mode = tk.StringVar(value="Stretch")
+        self.fit_mode = tk.StringVar(value="Degrees")
         self.pv_scale = 1.0
         self.pv_w = self.pv_h = 0
         self._pv_photo = None
@@ -310,13 +318,9 @@ class App(tk.Tk):
         ttk.Checkbutton(f, text="Show crosshair", variable=self.visible,
                         command=self._on_visible).grid(row=9, column=2, columnspan=2, sticky="w", **pad)
 
-        ttk.Label(f, text="Pixels / degree").grid(row=10, column=0, sticky="w", **pad)
-        spin = ttk.Spinbox(f, from_=0.1, to=10000, increment=1, width=8,
-                           textvariable=self.ppd, command=self.draw)
-        spin.grid(row=10, column=1, sticky="w", **pad)
-        self.ppd.trace_add("write", lambda *_: (self.draw(), self._sched_path_refresh()))
-        ttk.Label(f, text="origin = monitor center\n+X right, +Y up",
-                  foreground="#666").grid(row=10, column=2, columnspan=2, sticky="w", **pad)
+        ttk.Label(f, foreground="#666",
+                  text=f"Scale: {PIXELS_PER_DEGREE:g} px/°  ·  origin = monitor center, "
+                       f"+X right, +Y up").grid(row=10, column=0, columnspan=4, sticky="w", **pad)
 
         self.deg_label = ttk.Label(f, text="", font=("TkDefaultFont", 11, "bold"))
         self.deg_label.grid(row=11, column=0, columnspan=4, sticky="w", **pad)
@@ -337,7 +341,7 @@ class App(tk.Tk):
         ttk.Button(bar, text="Load picture…", command=self.load_image).pack(side="left")
         ttk.Button(bar, text="Clear", command=self.clear_image).pack(side="left", padx=4)
         mode = ttk.Combobox(bar, textvariable=self.fit_mode, state="readonly", width=9,
-                            values=["Stretch", "Fit", "Fill"])
+                            values=["Degrees", "Stretch", "Fit", "Fill"])
         mode.pack(side="right")
         mode.bind("<<ComboboxSelected>>", lambda e: self.rebuild_base())
 
@@ -352,8 +356,9 @@ class App(tk.Tk):
 
         self.img_label = ttk.Label(f, text="No picture loaded", foreground="#666")
         self.img_label.grid(row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        ttk.Label(f, text="Stretch: fill exactly · Fit: keep aspect, letterbox · Fill: keep aspect, crop. "
-                          "Scale and rotation apply on top of the mode, around the center.",
+        ttk.Label(f, text="Degrees: true angular scale (PREVIEW_IMAGE_PIXELS_PER_DEGREE), centered · "
+                          "Stretch: fill exactly · Fit: keep aspect, letterbox · Fill: keep aspect, "
+                          "crop. Scale and rotation apply on top, around the center.",
                   foreground="#666", wraplength=PREVIEW_MAX[0]).grid(row=7, column=0, columnspan=4, sticky="w")
 
         # Trajectory panel
@@ -477,7 +482,20 @@ class App(tk.Tk):
         if self.image is not None:
             size = (self.pv_w, self.pv_h)
             mode = self.fit_mode.get()
-            if mode == "Stretch":
+            if mode == "Degrees":
+                # True angular scale: the picture's px/deg mapped onto the monitor's px/deg,
+                # centered on the monitor center (0°, 0°).
+                g = (PIXELS_PER_DEGREE / PREVIEW_IMAGE_PIXELS_PER_DEGREE) * self.pv_scale
+                img = self.image
+                if g < 1:                         # pre-shrink for clean downscaling
+                    img = img.resize((max(1, round(img.width * g)), max(1, round(img.height * g))),
+                                     Image.LANCZOS)
+                    g = 1.0
+                cx, cy = self.pv_w / 2, self.pv_h / 2
+                coeffs = (1 / g, 0, img.width / 2 - cx / g, 0, 1 / g, img.height / 2 - cy / g)
+                self._base = img.transform(size, Image.AFFINE, coeffs, Image.BILINEAR,
+                                           fillcolor=(0, 0, 0))
+            elif mode == "Stretch":
                 self._base = self.image.resize(size, Image.LANCZOS)
             elif mode == "Fill":
                 self._base = ImageOps.fit(self.image, size, Image.LANCZOS)
@@ -536,7 +554,10 @@ class App(tk.Tk):
             return
         self.image_path = path
         name = path.replace("\\", "/").rsplit("/", 1)[-1]
-        self.img_label.config(text=f"{name} ({self.image.width}×{self.image.height})")
+        self.img_label.config(
+            text=f"{name} ({self.image.width}×{self.image.height} px = "
+                 f"{self.image.width / PREVIEW_IMAGE_PIXELS_PER_DEGREE:.1f}° × "
+                 f"{self.image.height / PREVIEW_IMAGE_PIXELS_PER_DEGREE:.1f}°)")
         self.img_scale.set(100)
         self.img_rot.set(0)
         self.rebuild_base()
@@ -699,13 +720,10 @@ class App(tk.Tk):
             self.color_btn.config(bg=c)
             self.draw()
 
-    def _ppd(self):
-        """Pixels per degree as a positive float, or None if the field is invalid."""
-        try:
-            v = float(self.ppd.get())
-            return v if v > 0 else None
-        except (ValueError, tk.TclError):
-            return None
+    @staticmethod
+    def _ppd():
+        """Monitor pixels per degree (hard-coded calibration constant)."""
+        return PIXELS_PER_DEGREE
 
     @staticmethod
     def _i(var):
@@ -741,7 +759,7 @@ class App(tk.Tk):
         lines = []
         for u, v in gen_pattern(name, R, max(2, n) if name != "Random" else n):
             x, y = (u, v) if self.traj_unit.get() == "deg" else (W / 2 + u, H / 2 - v)
-            lines.append(f"{x:.3f}, {y:.3f}")
+            lines.append(f"{x + 0.0:.3f}, {y + 0.0:.3f}")
         self._set_traj_text(f"# {name}\n" + "\n".join(lines))
 
     def _on_traj_unit(self, _=None):
@@ -763,7 +781,7 @@ class App(tk.Tk):
                     x, y = W / 2 + x * ppd, H / 2 - y * ppd
                 else:
                     x, y = (x - W / 2) / ppd, (H / 2 - y) / ppd
-                lines.append(f"{x:.3f}, {y:.3f}" + (f", {w:g}" if w else ""))
+                lines.append(f"{x + 0.0:.3f}, {y + 0.0:.3f}" + (f", {w:g}" if w else ""))
             self._set_traj_text("\n".join(lines))
         except ValueError:
             pass                                        # invalid text: leave it as typed
