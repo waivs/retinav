@@ -246,8 +246,11 @@ class App(tk.Tk):
         self.pv_w = self.pv_h = 0
         self._pv_photo = None
         self._base = None                       # image after Stretch/Fit/Fill, before zoom/rotate
-        self.img_scale = tk.IntVar(value=100)   # percent
-        self.img_rot = tk.IntVar(value=0)       # degrees, counter-clockwise
+        self.img_scale = tk.DoubleVar(value=100.0)   # percent
+        self.img_rot = tk.DoubleVar(value=0.0)       # degrees, counter-clockwise
+        self.img_shx = tk.DoubleVar(value=0.0)       # shift right (degrees)
+        self.img_shy = tk.DoubleVar(value=0.0)       # shift up (degrees)
+        self._shown_vars = []                        # keeps slider value-label variables alive
 
         self.overlay = Overlay(self)
         self.overlay.place_on(self.mon)
@@ -361,24 +364,30 @@ class App(tk.Tk):
         mode.bind("<<ComboboxSelected>>", lambda e: self.rebuild_base())
 
         # Image scale / rotation
+        limx, limy = self.mon.width / PIXELS_PER_DEGREE, self.mon.height / PIXELS_PER_DEGREE
         self._slider(f, 3, "Scale %", self.img_scale, 10, 400, command=self._on_transform)
-        self._slider(f, 4, "Rotate °", self.img_rot, -180, 180, command=self._on_transform)
+        self._slider(f, 4, "Rotate °", self.img_rot, -180, 180, command=self._on_transform, decimals=1)
+        self.shx_scale = self._slider(f, 5, "Shift X °", self.img_shx, -limx, limx,
+                                      command=self._on_transform, decimals=2)
+        self.shy_scale = self._slider(f, 6, "Shift Y °", self.img_shy, -limy, limy,
+                                      command=self._on_transform, decimals=2)
         tools = ttk.Frame(f)
-        tools.grid(row=5, column=0, columnspan=4, sticky="w", padx=8, pady=2)
+        tools.grid(row=7, column=0, columnspan=4, sticky="w", padx=8, pady=2)
         ttk.Button(tools, text="⟲ 90°", width=7, command=lambda: self.rotate_by(90)).pack(side="left")
         ttk.Button(tools, text="⟳ 90°", width=7, command=lambda: self.rotate_by(-90)).pack(side="left", padx=4)
-        ttk.Button(tools, text="Reset scale/rotation", command=self.reset_transform).pack(side="left")
+        ttk.Button(tools, text="Reset scale/rotate/shift", command=self.reset_transform).pack(side="left")
 
         self.img_label = ttk.Label(f, text="No picture loaded", foreground="#666")
-        self.img_label.grid(row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.img_label.grid(row=8, column=0, columnspan=4, sticky="w", pady=(4, 0))
         ttk.Label(f, text="Degrees: true angular scale (PREVIEW_IMAGE_PIXELS_PER_DEGREE), centered on the origin · "
                           "Stretch: fill exactly · Fit: keep aspect, letterbox · Fill: keep aspect, "
-                          "crop. Scale and rotation apply on top, around the center (the origin in Degrees mode).",
-                  foreground="#666", wraplength=PREVIEW_MAX[0]).grid(row=7, column=0, columnspan=4, sticky="w")
+                          "crop. Scale and rotation apply on top, around the center (the origin in Degrees "
+                          "mode); Shift then moves the picture (+X right, +Y up).",
+                  foreground="#666", wraplength=PREVIEW_MAX[0]).grid(row=9, column=0, columnspan=4, sticky="w")
 
         # Trajectory panel
         tf = ttk.LabelFrame(f, text="Trajectory", padding=6)
-        tf.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        tf.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
         r1 = ttk.Frame(tf)
         r1.grid(row=0, column=0, sticky="w")
@@ -439,14 +448,24 @@ class App(tk.Tk):
         self.generate_pattern()
         self.resize_preview()
 
-    def _slider(self, parent, row, label, var, lo, hi, redraw=True, command=None):
+    def _slider(self, parent, row, label, var, lo, hi, redraw=True, command=None, decimals=0):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=2)
         scale = ttk.Scale(parent, from_=lo, to=hi, variable=var, orient="horizontal",
                           length=220,
                           command=(lambda _=None: command()) if command
                           else (lambda _=None: self.draw()) if redraw else None)
         scale.grid(row=row, column=1, columnspan=2, sticky="ew", padx=8, pady=2)
-        ttk.Label(parent, textvariable=var, width=5).grid(row=row, column=3)
+        shown = tk.StringVar()
+        self._shown_vars.append(shown)
+
+        def refresh(*_):
+            try:
+                shown.set(f"{float(self.getvar(str(var))):.{decimals}f}")
+            except (tk.TclError, ValueError):
+                pass
+        var.trace_add("write", refresh)
+        refresh()
+        ttk.Label(parent, textvariable=shown, width=6, anchor="e").grid(row=row, column=3)
         return scale
 
     def _bind_keys(self):
@@ -498,6 +517,9 @@ class App(tk.Tk):
         self.pv_w = max(1, round(W * self.pv_scale))
         self.pv_h = max(1, round(H * self.pv_scale))
         self.pv.config(width=self.pv_w, height=self.pv_h)
+        limx, limy = W / PIXELS_PER_DEGREE, H / PIXELS_PER_DEGREE
+        self.shx_scale.config(from_=-limx, to=limx)
+        self.shy_scale.config(from_=-limy, to=limy)
         self.rebuild_base()
         self._draw_origin_marker()
         self._refresh_path()
@@ -556,8 +578,11 @@ class App(tk.Tk):
         else:
             cx, cy = self.pv_w / 2, self.pv_h / 2
         # Inverse affine: output pixel -> source pixel
-        coeffs = (c / sc, -s_ / sc, cx - (cx * c - cy * s_) / sc,
-                  s_ / sc, c / sc, cy - (cx * s_ + cy * c) / sc)
+        k = PIXELS_PER_DEGREE * self.pv_scale             # preview pixels per degree
+        ax = cx + self.img_shx.get() * k                  # where the pivot ends up after shifting
+        ay = cy - self.img_shy.get() * k
+        coeffs = (c / sc, -s_ / sc, cx - (ax * c - ay * s_) / sc,
+                  s_ / sc, c / sc, cy - (ax * s_ + ay * c) / sc)
         img = self._base.transform((self.pv_w, self.pv_h), Image.AFFINE, coeffs,
                                    Image.BILINEAR, fillcolor=(0, 0, 0))
         self._pv_photo = ImageTk.PhotoImage(img)
@@ -575,6 +600,8 @@ class App(tk.Tk):
     def reset_transform(self):
         self.img_scale.set(100)
         self.img_rot.set(0)
+        self.img_shx.set(0)
+        self.img_shy.set(0)
         self.render_preview_bg()
 
     def load_image(self):
@@ -599,6 +626,8 @@ class App(tk.Tk):
                  f"{self.image.height / PREVIEW_IMAGE_PIXELS_PER_DEGREE:.1f}°)")
         self.img_scale.set(100)
         self.img_rot.set(0)
+        self.img_shx.set(0)
+        self.img_shy.set(0)
         self.rebuild_base()
 
     def clear_image(self):
