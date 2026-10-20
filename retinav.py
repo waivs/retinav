@@ -58,12 +58,15 @@ OVERLAY_BG = "#000000"     # background of the full-screen window on the second 
 # ---- Calibration: edit these for your particular monitor / picture ----
 PIXELS_PER_DEGREE = 40.0                 # monitor pixels per degree of visual angle
 PREVIEW_IMAGE_PIXELS_PER_DEGREE = 40.0   # pixels of the loaded picture per degree (its angular scale)
+DEFAULT_TRAJECTORY_UNIT = "deg"          # "deg" or "px"
+DEFAULT_PATTERN = "Spiral"               # initial trajectory pattern
 if PIXELS_PER_DEGREE <= 0 or PREVIEW_IMAGE_PIXELS_PER_DEGREE <= 0:
     raise ValueError("PIXELS_PER_DEGREE and PREVIEW_IMAGE_PIXELS_PER_DEGREE must be positive")
 PREVIEW_BG = OVERLAY_BG
 
 PATTERNS = ["Custom list", "Circle", "Square", "Figure-8", "Spiral", "Raster", "Random"]
-PATTERN_POINTS = {"Circle": 36, "Square": 4, "Figure-8": 72, "Spiral": 120, "Raster": 6, "Random": 8}
+PATTERN_POINTS = {"Circle": 36, "Figure-8": 72, "Spiral": 120, "Random": 8}   # default Points
+PATTERN_TURNS = {"Spiral": 3, "Raster": 6}       # default Turns (spiral) / Passes (raster)
 
 
 # ---- trajectory helpers (pure functions, no GUI) ----
@@ -98,8 +101,9 @@ def to_pixels(pts, unit, W, H, ppd):
     return out, clamped
 
 
-def gen_pattern(name, R, n, rng=random):
-    """Pattern offsets (u, v) from the center, v pointing up, in the same unit as R."""
+def gen_pattern(name, R, n, turns=3, rng=random):
+    """Pattern offsets (u, v) from the center, v pointing up, in the same unit as R.
+    n = points (circle, figure-8, spiral, random); turns = spiral turns or raster passes."""
     if name == "Circle":
         return [(R * math.cos(2 * math.pi * i / n), R * math.sin(2 * math.pi * i / n))
                 for i in range(n + 1)]
@@ -112,11 +116,11 @@ def gen_pattern(name, R, n, rng=random):
         out = []
         for i in range(n):
             f = i / max(1, n - 1)
-            th = 3 * 2 * math.pi * f            # three turns
+            th = turns * 2 * math.pi * f
             out.append((R * f * math.cos(th), R * f * math.sin(th)))
         return out
     if name == "Raster":
-        rows, out = max(2, n), []
+        rows, out = max(2, round(turns)), []
         for r in range(rows):
             v = R - 2 * R * r / (rows - 1)
             xs = (-R, R) if r % 2 == 0 else (R, -R)
@@ -202,11 +206,13 @@ class App(tk.Tk):
         self._anim_id = None
 
         # Trajectory state
-        self.pat_name = tk.StringVar(value="Circle")
-        self.pat_size = tk.StringVar(value="10")
-        self.pat_n = tk.StringVar(value=str(PATTERN_POINTS["Circle"]))
-        self.traj_unit = tk.StringVar(value="deg")
-        self._unit_prev = "deg"
+        self.pat_name = tk.StringVar(value=DEFAULT_PATTERN)
+        self.pat_size = tk.StringVar(value="10" if DEFAULT_TRAJECTORY_UNIT == "deg" else "300")
+        self.pat_n = tk.StringVar(value=str(PATTERN_POINTS.get(DEFAULT_PATTERN, 36)))
+        self.pat_turns = tk.StringVar(value=str(PATTERN_TURNS.get(DEFAULT_PATTERN, 3)))
+        self.turns_label = tk.StringVar(value="Turns")
+        self.traj_unit = tk.StringVar(value=DEFAULT_TRAJECTORY_UNIT)
+        self._unit_prev = DEFAULT_TRAJECTORY_UNIT
         self.traj_loop = tk.BooleanVar(value=False)
         self._traj = None            # running trajectory state, or None
         self._path_after = None
@@ -375,12 +381,21 @@ class App(tk.Tk):
         ttk.Spinbox(r1, from_=0.1, to=10000, increment=1, width=6,
                     textvariable=self.pat_size).pack(side="left", padx=4)
         ttk.Label(r1, text="Points").pack(side="left")
-        ttk.Spinbox(r1, from_=2, to=2000, increment=1, width=5,
-                    textvariable=self.pat_n).pack(side="left", padx=4)
-        ttk.Button(r1, text="Generate", command=self.generate_pattern).pack(side="left", padx=4)
+        self.points_spin = ttk.Spinbox(r1, from_=2, to=2000, increment=1, width=5,
+                                       textvariable=self.pat_n)
+        self.points_spin.pack(side="left", padx=4)
+
+        r1b = ttk.Frame(tf)
+        r1b.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(r1b, textvariable=self.turns_label, width=6).pack(side="left")
+        self.turns_spin = ttk.Spinbox(r1b, from_=0.25, to=100, increment=0.5, width=6,
+                                      textvariable=self.pat_turns)
+        self.turns_spin.pack(side="left", padx=4)
+        self.gen_btn = ttk.Button(r1b, text="Generate", command=self.generate_pattern)
+        self.gen_btn.pack(side="left", padx=8)
 
         r2 = ttk.Frame(tf)
-        r2.grid(row=1, column=0, sticky="w", pady=4)
+        r2.grid(row=2, column=0, sticky="w", pady=4)
         ttk.Label(r2, text="Coordinates in").pack(side="left")
         ucb = ttk.Combobox(r2, textvariable=self.traj_unit, state="readonly", width=5,
                            values=["deg", "px"])
@@ -390,7 +405,7 @@ class App(tk.Tk):
                         command=self._refresh_path).pack(side="left", padx=10)
 
         tw = ttk.Frame(tf)
-        tw.grid(row=2, column=0, sticky="ew")
+        tw.grid(row=3, column=0, sticky="ew")
         self.traj_text = tk.Text(tw, width=52, height=6, wrap="none", font="TkFixedFont", undo=True)
         sb = ttk.Scrollbar(tw, orient="vertical", command=self.traj_text.yview)
         self.traj_text.config(yscrollcommand=sb.set)
@@ -401,7 +416,7 @@ class App(tk.Tk):
         self.traj_text.bind("<<Cut>>", lambda e: self._sched_path_refresh())
 
         r3 = ttk.Frame(tf)
-        r3.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        r3.grid(row=4, column=0, sticky="ew", pady=(6, 0))
         self.traj_btn = ttk.Button(r3, text="▶ Start", width=10, command=self.toggle_trajectory)
         self.traj_btn.pack(side="left")
         self.traj_status = ttk.Label(r3, text="", foreground="#666", wraplength=340)
@@ -409,8 +424,9 @@ class App(tk.Tk):
         ttk.Label(tf, foreground="#666", wraplength=PREVIEW_MAX[0],
                   text="One point per line: x, y [, wait seconds]. Lines starting with # are "
                        "comments. The crosshair follows the path at the Speed setting."
-                  ).grid(row=4, column=0, sticky="w", pady=(4, 0))
+                  ).grid(row=5, column=0, sticky="w", pady=(4, 0))
 
+        self._update_pattern_widgets()
         self.generate_pattern()
         self.resize_preview()
 
@@ -737,10 +753,24 @@ class App(tk.Tk):
         self._refresh_path(True)
 
     def _on_pattern_change(self, _=None):
-        n = PATTERN_POINTS.get(self.pat_name.get())
-        if n:
-            self.pat_n.set(str(n))
+        name = self.pat_name.get()
+        if name in PATTERN_POINTS:
+            self.pat_n.set(str(PATTERN_POINTS[name]))
+        if name in PATTERN_TURNS:
+            self.pat_turns.set(str(PATTERN_TURNS[name]))
+        self._update_pattern_widgets()
         self.generate_pattern()
+
+    def _update_pattern_widgets(self):
+        """Enable only the parameters that the selected pattern actually uses."""
+        name = self.pat_name.get()
+        self.turns_label.set("Passes" if name == "Raster" else "Turns")
+
+        def enable(widget, on):
+            widget.state(["!disabled"] if on else ["disabled"])
+        enable(self.points_spin, name in PATTERN_POINTS)
+        enable(self.turns_spin, name in PATTERN_TURNS)
+        enable(self.gen_btn, name != "Custom list")
 
     def generate_pattern(self):
         name = self.pat_name.get()
@@ -749,15 +779,18 @@ class App(tk.Tk):
             return
         try:
             R, n = float(self.pat_size.get()), int(float(self.pat_n.get()))
+            turns = float(self.pat_turns.get())
         except ValueError:
-            self.traj_status.config(text="Size and Points must be numbers.", foreground="#b00020")
+            self.traj_status.config(text="Size, Points and Turns/Passes must be numbers.",
+                                    foreground="#b00020")
             return
-        if R <= 0 or n < 1:
-            self.traj_status.config(text="Size must be > 0 and Points ≥ 1.", foreground="#b00020")
+        if R <= 0 or n < 1 or turns <= 0:
+            self.traj_status.config(text="Size and Turns/Passes must be > 0, Points ≥ 1.",
+                                    foreground="#b00020")
             return
         W, H = self.mon.width, self.mon.height
         lines = []
-        for u, v in gen_pattern(name, R, max(2, n) if name != "Random" else n):
+        for u, v in gen_pattern(name, R, max(2, n) if name != "Random" else n, turns):
             x, y = (u, v) if self.traj_unit.get() == "deg" else (W / 2 + u, H / 2 - v)
             lines.append(f"{x + 0.0:.3f}, {y + 0.0:.3f}")
         self._set_traj_text(f"# {name}\n" + "\n".join(lines))
