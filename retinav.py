@@ -40,6 +40,7 @@ import sys
 import time
 import tkinter as tk
 from tkinter import ttk, colorchooser, filedialog, messagebox
+from tkinter import font as tkfont
 
 from PIL import Image, ImageOps, ImageTk
 from screeninfo import get_monitors
@@ -58,6 +59,7 @@ OVERLAY_BG = "#000000"     # background of the full-screen window on the second 
 # ---- Calibration: edit these for your particular monitor / picture ----
 PIXELS_PER_DEGREE = 40.0                 # monitor pixels per degree of visual angle
 PREVIEW_IMAGE_PIXELS_PER_DEGREE = 40.0   # pixels of the loaded picture per degree (its angular scale)
+POSITION_FONT_SIZE = 32                  # point size of the large X/Y position readout (degrees)
 DEFAULT_TRAJECTORY_UNIT = "deg"          # "deg" or "px"
 DEFAULT_PATTERN = "Spiral"               # initial trajectory pattern
 if PIXELS_PER_DEGREE <= 0 or PREVIEW_IMAGE_PIXELS_PER_DEGREE <= 0:
@@ -328,7 +330,9 @@ class App(tk.Tk):
                   text=f"Scale: {PIXELS_PER_DEGREE:g} px/°  ·  origin = monitor center, "
                        f"+X right, +Y up").grid(row=10, column=0, columnspan=4, sticky="w", **pad)
 
-        self.deg_label = ttk.Label(f, text="", font=("TkDefaultFont", 11, "bold"))
+        # Large fixed-width readout so the layout doesn't jitter as digits change
+        big = (tkfont.nametofont("TkFixedFont").actual("family"), POSITION_FONT_SIZE, "bold")
+        self.deg_label = ttk.Label(f, text="", font=big, width=11, anchor="w", justify="left")
         self.deg_label.grid(row=11, column=0, columnspan=4, sticky="w", **pad)
         self.status = ttk.Label(f, text="", justify="left")
         self.status.grid(row=12, column=0, columnspan=4, sticky="w", **pad)
@@ -983,8 +987,9 @@ class App(tk.Tk):
         if ppd is None:
             self.deg_label.config(text="Degrees: enter a positive pixels/degree value")
         else:
+            fmt = lambda v: f"{round(v, 2) + 0.0:+8.2f}"      # no "-0.00"
             self.deg_label.config(
-                text=f"X {(x - W / 2) / ppd:+.2f}°    Y {(H / 2 - y) / ppd:+.2f}°")
+                text=f"X {fmt((x - W / 2) / ppd)}°\nY {fmt((H / 2 - y) / ppd)}°")
             extra = f"\nMonitor spans {W / ppd:.1f}° × {H / ppd:.1f}°"
             if moving:
                 extra += (f"\nTarget: X {(tx - W / 2) / ppd:+.2f}°  Y {(H / 2 - ty) / ppd:+.2f}°"
